@@ -44,8 +44,12 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      # マイグレーションに native build は不要。--ignore-scripts で
+      # ERR_PNPM_IGNORED_BUILDS（未承認ビルドスクリプトによる失敗）を回避する。
+      # drizzle-kit が使う esbuild のバイナリは optionalDependencies から入るため
+      # postinstall を実行しなくても動作する。
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
       # GitHub OIDC で AWS ロールを引き受ける（静的なアクセスキー不要）。
       - name: Configure AWS credentials
