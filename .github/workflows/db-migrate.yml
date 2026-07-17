@@ -1,0 +1,71 @@
+name: DB Migrate
+
+# main へのマージ（push）でマイグレーションを Aurora に適用する。
+# マイグレーションファイル（drizzle/）が変わった時だけ走るようにして無駄な実行を避ける。
+on:
+  push:
+    branches: [main]
+    paths:
+      - "drizzle/**"
+      - "db/schema.ts"
+      - "drizzle.config.ts"
+      - ".github/workflows/db-migrate.yml"
+  # 手動実行も可能にしておく（再適用やロールバック確認用）。
+  workflow_dispatch:
+
+# マイグレーションの多重実行を防ぐ。前の実行はキャンセルせず直列化する。
+concurrency:
+  group: db-migrate-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # AWS への OIDC 認証に必要
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    # 承認フローや環境シークレットを使う場合は GitHub の Environment を利用する。
+    environment: production
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      PGHOST: ${{ vars.PGHOST }}
+      PGPORT: ${{ vars.PGPORT }}
+      PGUSER: ${{ vars.PGUSER }}
+      PGDATABASE: ${{ vars.PGDATABASE }}
+      PGSSLMODE: require
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # GitHub OIDC で AWS ロールを引き受ける（静的なアクセスキー不要）。
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # RDS IAM 認証用の一時トークンを生成し、PGPASSWORD として渡す。
+      # トークンは約15分有効。ログに出さないようマスクする。
+      - name: Generate RDS IAM auth token
+        run: |
+          TOKEN=$(aws rds generate-db-auth-token \
+            --hostname "$PGHOST" \
+            --port "$PGPORT" \
+            --username "$PGUSER" \
+            --region "$AWS_REGION")
+          echo "::add-mask::$TOKEN"
+          echo "PGPASSWORD=$TOKEN" >> "$GITHUB_ENV"
+
+      # drizzle/ にコミット済みの未適用マイグレーションを順に適用する。
+      - name: Run migrations
+        run: pnpm exec drizzle-kit migrate
