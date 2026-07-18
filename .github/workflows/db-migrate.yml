@@ -28,11 +28,11 @@ jobs:
     # 承認フローや環境シークレットを使う場合は GitHub の Environment を利用する。
     environment: production
     env:
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-      PGHOST: ${{ secrets.PGHOST }}
-      PGPORT: ${{ secrets.PGPORT }}
-      PGUSER: ${{ secrets.PGUSER }}
-      PGDATABASE: ${{ secrets.PGDATABASE }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      PGHOST: ${{ vars.PGHOST }}
+      PGPORT: ${{ vars.PGPORT }}
+      PGUSER: ${{ vars.PGUSER }}
+      PGDATABASE: ${{ vars.PGDATABASE }}
       PGSSLMODE: require
     steps:
       - uses: actions/checkout@v4
@@ -55,8 +55,8 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
       # RDS IAM 認証用の一時トークンを生成し、PGPASSWORD として渡す。
       # トークンは約15分有効。ログに出さないようマスクする。
