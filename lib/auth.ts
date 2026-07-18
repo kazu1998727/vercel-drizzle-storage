@@ -4,7 +4,30 @@ import { nextCookies } from "better-auth/next-js";
 
 import { db, schema } from "@/db";
 
+/**
+ * ベースURLを決定する。
+ * - 明示指定の BETTER_AUTH_URL を最優先。
+ * - Vercel では本番ドメイン（VERCEL_PROJECT_PRODUCTION_URL）を使う。
+ * - ローカルは未指定（Better Auth が http://localhost:3000 を既定にする）。
+ */
+function getBaseURL(): string | undefined {
+  if (process.env.BETTER_AUTH_URL) return process.env.BETTER_AUTH_URL;
+  if (process.env.VERCEL_PROJECT_PRODUCTION_URL) {
+    return `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`;
+  }
+  return undefined;
+}
+
+// プレビューデプロイ等、ベースURL以外のオリジンからのリクエストを許可する。
+const trustedOrigins = [
+  process.env.VERCEL_URL && `https://${process.env.VERCEL_URL}`,
+  process.env.VERCEL_BRANCH_URL && `https://${process.env.VERCEL_BRANCH_URL}`,
+].filter((v): v is string => Boolean(v));
+
 export const auth = betterAuth({
+  // secret は BETTER_AUTH_SECRET から自動で読まれる。本番では必須。
+  baseURL: getBaseURL(),
+  trustedOrigins,
   database: drizzleAdapter(db, {
     provider: "pg",
     schema,
