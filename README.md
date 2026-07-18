@@ -20,52 +20,102 @@ You can start editing the page by modifying `app/page.tsx`. The page auto-update
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 
-## 認証・DB セットアップ (Drizzle + Better Auth)
+## 認証・DB 構成 (Drizzle + Better Auth + Aurora)
 
-このプロジェクトには [Drizzle ORM](https://orm.drizzle.team) と [Better Auth](https://www.better-auth.com) の最小構成が含まれています。DB は Amazon Aurora PostgreSQL (node-postgres ドライバ) を想定しています。
+[Drizzle ORM](https://orm.drizzle.team) と [Better Auth](https://www.better-auth.com) の最小構成です。
+DB は **Amazon Aurora PostgreSQL**（[Vercel Marketplace の AWS 統合](https://vercel.com/marketplace/aws/aws-apg)）を使い、
+**静的なパスワードを一切持たず、RDS IAM 認証**で接続します。
 
-### 1. 環境変数
+### 接続の仕組み（重要）
 
-`.env.example` をコピーして `.env` を作成し、値を設定します。
+Vercel の AWS 統合は、DB のパスワードではなく以下を提供します。
 
-```bash
-cp .env.example .env
-# BETTER_AUTH_SECRET は以下で生成
-openssl rand -base64 32
+- 接続情報の環境変数: `PGHOST` / `PGPORT` / `PGUSER` / `PGDATABASE` / `AWS_REGION` / `AWS_ROLE_ARN`
+- Vercel の OIDC トークン（`VERCEL_OIDC_TOKEN`、ビルド時・実行時とも利用可能）
+
+接続時は次の流れでトークンを生成します（[db/connection.ts](db/connection.ts)）。
+
+```
+Vercel OIDC トークン
+  └─(awsCredentialsProvider: STS AssumeRoleWithWebIdentity で AWS_ROLE_ARN を引き受け)
+        └─ AWS 一時認証情報
+              └─(@aws-sdk/rds-signer: 15分有効の IAM 認証トークンを生成)
+                    └─ pg の password として渡して Aurora に接続
 ```
 
-### 2. スキーマをDBへ反映
-
-```bash
-# マイグレーションファイルを生成
-pnpm db:generate
-# DBへ適用
-pnpm db:migrate
-# （プロトタイプ中はマイグレーションを介さず直接反映も可能）
-# pnpm db:push
-```
-
-### 3. 開発サーバーを起動
-
-```bash
-pnpm dev
-```
-
-[http://localhost:3000/auth-demo](http://localhost:3000/auth-demo) でサインアップ / サインイン / サインアウトを試せます。
+`pg` の `password` に関数を渡しているため、接続確立ごとに新しいトークンが生成され、失効しません。
+ローカルなど `DATABASE_URL` がある場合はそちらを優先します。
 
 ### ファイル構成
 
 | パス | 役割 |
 | --- | --- |
-| `db/schema.ts` | Better Auth のテーブル定義 (user / session / account / verification) |
-| `db/index.ts` | Drizzle + pg コネクションプール |
-| `drizzle.config.ts` | drizzle-kit の設定 |
-| `lib/auth.ts` | Better Auth サーバーインスタンス (email+password 有効) |
-| `lib/auth-client.ts` | クライアント用フック (`signIn` / `signUp` / `signOut` / `useSession`) |
-| `app/api/auth/[...all]/route.ts` | Better Auth の API ハンドラ |
-| `app/auth-demo/page.tsx` | 動作確認用デモページ |
+| [db/schema.ts](db/schema.ts) | Better Auth のテーブル定義 (user / session / account / verification) |
+| [db/connection.ts](db/connection.ts) | Vercel OIDC + RDS IAM でトークンを生成する pg Pool の生成 |
+| [db/index.ts](db/index.ts) | アプリ用 Drizzle インスタンス（Pool を再利用） |
+| [db/migrate.ts](db/migrate.ts) | マイグレーション適用スクリプト（プログラム的マイグレータ） |
+| [drizzle.config.ts](drizzle.config.ts) | drizzle-kit の設定（`generate` 用。`DATABASE_URL` / `PG*` に対応） |
+| [lib/auth.ts](lib/auth.ts) | Better Auth サーバー（email+password、baseURL / trustedOrigins を Vercel 向けに設定） |
+| [lib/auth-client.ts](lib/auth-client.ts) | クライアント用フック (`signIn` / `signUp` / `signOut` / `useSession`) |
+| [app/api/auth/[...all]/route.ts](app/api/auth/[...all]/route.ts) | Better Auth の API ハンドラ |
+| [app/auth-demo/page.tsx](app/auth-demo/page.tsx) | 動作確認用デモページ |
+| [vercel.json](vercel.json) | インストールコマンド上書き（`--ignore-scripts`、下記参照） |
 
-サーバーコンポーネントでセッションを取得する例:
+### 環境変数
+
+`PGHOST` などの DB 接続系は **Vercel の AWS 統合が自動注入**します。手動で設定が必要なのは Better Auth 関連です。
+
+| 変数 | 用途 | 設定場所 |
+| --- | --- | --- |
+| `BETTER_AUTH_SECRET` | セッション署名・暗号化（**本番必須**）。`openssl rand -base64 32` で生成 | Vercel / `.env` |
+| `BETTER_AUTH_URL` | 本番の正規URL（未設定時は Vercel の本番ドメインを自動採用） | Vercel（任意） |
+| `DATABASE_URL` | ローカルで通常の Postgres に繋ぐ場合のみ | `.env`（任意） |
+
+### マイグレーション（ビルド時に自動適用）
+
+`build` スクリプトは `tsx db/migrate.ts && next build`（[package.json](package.json)）。
+**Vercel のデプロイ時に、アプリ本体と同じ IAM 認証で `drizzle/` の未適用マイグレーションを適用**してから
+Next.js をビルドします。マイグレータは冪等（適用済みは `__drizzle_migrations` で管理）です。
+
+スキーマを変更したときの流れ:
+
+```bash
+# 1. db/schema.ts を編集
+# 2. マイグレーションSQLを生成（DB接続不要）
+pnpm db:generate
+# 3. 生成された drizzle/ をコミットして push → Vercel デプロイ時に自動適用
+```
+
+ローカルの Postgres に対して手動適用したい場合は、`DATABASE_URL` を設定して `pnpm db:migrate` を実行します。
+
+> **注意**: この方式はデプロイが DB 到達性に依存します（ビルド環境から Aurora に接続できないとビルドが失敗）。
+> ビルド環境から到達できない構成の場合は、マイグレーションを実行時（保護された API ルート等）に移す方式へ切り替えてください。
+
+### ローカル開発
+
+Vercel の OIDC はローカルには無いため、ローカルで DB を使うには `.env` に `DATABASE_URL` を設定してください
+（別途ローカル/リモートの Postgres を用意）。設定後:
+
+```bash
+pnpm dev
+# http://localhost:3000/auth-demo でサインアップ / サインイン / サインアウトを確認
+```
+
+### 認証の使い方
+
+クライアント（[lib/auth-client.ts](lib/auth-client.ts)）:
+
+```tsx
+"use client";
+import { signIn, signUp, signOut, useSession } from "@/lib/auth-client";
+
+const { data: session } = useSession();
+await signUp.email({ name, email, password });
+await signIn.email({ email, password });
+await signOut();
+```
+
+サーバーコンポーネントでセッション取得:
 
 ```ts
 import { headers } from "next/headers";
@@ -74,59 +124,12 @@ import { auth } from "@/lib/auth";
 const session = await auth.api.getSession({ headers: await headers() });
 ```
 
-## CI での自動マイグレーション (GitHub Actions)
+### インストールについて（vercel.json）
 
-`main` へ push（マージ）され、かつマイグレーションファイル (`drizzle/**`) 等が変更された場合に
-[.github/workflows/db-migrate.yml](.github/workflows/db-migrate.yml) が Aurora へマイグレーションを適用します。
-
-**運用フロー**
-
-1. スキーマ (`db/schema.ts`) を変更する
-2. ローカルで `pnpm db:generate` を実行し、生成された `drizzle/` をコミットする
-3. PR を作成 → `main` にマージ
-4. Actions が OIDC で AWS ロールを引き受け、RDS IAM トークンを生成して `drizzle-kit migrate` を実行
-
-静的なDBパスワードやアクセスキーは保存せず、GitHub OIDC + RDS IAM 認証で接続します。
-
-### 事前準備（必須）
-
-1. **GitHub Actions 用の AWS ロール**
-   `.env.example` の `AWS_ROLE_ARN` (`role/Vercel/access-vercel-db`) は Vercel 用の信頼ポリシーの
-   可能性が高いため、そのままでは GitHub から引き受けられません。GitHub OIDC プロバイダ
-   (`token.actions.githubusercontent.com`) を信頼し、`rds-db:connect` を許可した
-   ロールを別途用意し、リポジトリ Variables の `AWS_ROLE_ARN` に設定してください。
-
-2. **リポジトリ Variables**（Settings → Secrets and variables → Actions → Variables）
-   | 名前 | 値 |
-   | --- | --- |
-   | `AWS_REGION` | `ap-northeast-1` |
-   | `AWS_ROLE_ARN` | GitHub が引き受け可能なロールの ARN |
-   | `PGHOST` | Aurora のエンドポイント |
-   | `PGPORT` | `5432` |
-   | `PGUSER` | IAM 認証を有効化した DB ユーザー |
-   | `PGDATABASE` | `postgres` |
-
-3. **DBユーザーの IAM 認証有効化**
-   接続に使う DB ユーザーに `rds_iam` ロールを付与しておく必要があります。
-   ```sql
-   GRANT rds_iam TO <db_user>;
-   ```
-
-4. **ネットワーク到達性（重要）**
-   GitHub 管理ランナー（動的な公開IP）から Aurora へ TCP 到達できる必要があります。
-   Aurora が VPC 内で非公開の場合、このワークフローは接続に失敗します。次のいずれかで解消してください。
-   - Aurora を publicly accessible にし、Security Group で接続を許可する
-   - VPC 内の **self-hosted runner** を使う（`runs-on` を変更）
-   - VPN / bastion / AWS 経由でトンネルする
-
-   到達性が確保できない場合は self-hosted runner 構成に切り替えるのが現実的です。
-
-### パスワード認証で運用する場合（代替）
-
-IAM を使わず接続文字列で運用する場合は、`DATABASE_URL` をリポジトリ Secret に登録し、
-ワークフローの「Configure AWS credentials」「Generate RDS IAM auth token」ステップを削除して、
-`Run migrations` ステップの前に `DATABASE_URL` を `env` で渡してください。
-`drizzle.config.ts` は `DATABASE_URL` があればそちらを優先します。
+pnpm 10/11 は未承認のビルドスクリプトがあると `pnpm install` を失敗させます
+（`esbuild` など）。マイグレーション/ビルドにこれらのネイティブビルドは不要で、必要な
+バイナリは optionalDependencies から入るため、[vercel.json](vercel.json) で
+`pnpm install --frozen-lockfile --ignore-scripts` を指定して回避しています。
 
 ## Learn More
 
